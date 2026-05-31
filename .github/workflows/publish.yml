@@ -1,0 +1,32 @@
+name: Publish feat-sdk to RubyGems
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - run: rake test
+
+  publish:
+    name: Push to RubyGems via OIDC
+    needs: test
+    runs-on: ubuntu-latest
+    environment: rubygems-publish
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - uses: rubygems/release-gem@v1
