@@ -1,5 +1,5 @@
 Gem::Specification.new do |spec|
-  spec.name          = "feathq-ruby-sdk"
+  spec.name          = "feat-sdk"
   spec.version       = "0.1.0"
   spec.authors       = ["feat HQ"]
   spec.email         = ["engineering@feat.so"]

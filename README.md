@@ -1,12 +1,12 @@
-# feathq-ruby-sdk
+# feat-sdk
 
-Server-side Ruby SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Standard library only — no gem dependencies.
+Server-side Ruby SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Standard library only - no gem dependencies.
 
 ## Install
 
 ```ruby
 # Gemfile
-gem "feathq-ruby-sdk"
+gem "feat-sdk"
 ```
 
 ```bash
