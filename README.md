@@ -26,16 +26,12 @@ client = Feat::Client.new(
 )
 client.start
 
-result = client.evaluate(
-  "checkout-v2",
-  default_value: false,
-  context: {
-    targetingKey: "user-123",
-    user: { plan: "pro", email: "alice@example.com" },
-  },
-)
+ctx = {
+  targetingKey: "user-123",
+  user: { plan: "pro", email: "alice@example.com" },
+}
 
-if result.value
+if client.get_boolean_value("checkout-v2", false, ctx)
   # ...
 end
 
