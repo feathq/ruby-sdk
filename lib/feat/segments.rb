@@ -3,8 +3,7 @@ module Feat
     module_function
 
     # True iff context matches the segment. Unknown segment keys
-    # evaluate to false (matches the control plane's "delete cascade
-    # prevented" guarantee for active references).
+    # evaluate to false (never raise).
     def match_segment(segment_key, ctx, datafile)
       seg = datafile.segments[segment_key]
       return false if seg.nil?

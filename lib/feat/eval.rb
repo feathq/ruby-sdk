@@ -33,7 +33,7 @@ module Feat
       if flag.nil?
         return EvaluationResult.new(
           value: default_value, reason: Reason::ERROR,
-          error_message: "flag '#{flag_key}' not found in datafile"
+          error_message: "flag could not be evaluated"
         )
       end
 
@@ -94,7 +94,7 @@ module Feat
       if v.nil?
         return EvaluationResult.new(
           value: default_value, reason: Reason::ERROR,
-          error_message: "variation '#{variation_id}' missing from flag '#{flag.key}'"
+          error_message: "flag could not be evaluated"
         )
       end
       EvaluationResult.new(value: v.value, variation_id: variation_id, reason: reason)

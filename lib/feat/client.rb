@@ -3,19 +3,21 @@ require "net/http"
 require "uri"
 
 module Feat
-  # Polling HTTP client. Uses stdlib only — zero gem dependencies.
+  # Polling HTTP client. Uses stdlib only - zero gem dependencies.
   class Client
-    # Background polling defaults: refresh every 30 seconds, matching
-    # Cloudflare KV's typical global-replication ceiling.
     DEFAULT_POLL_INTERVAL = 30.0
+    MIN_POLL_INTERVAL = 5.0
+    MAX_DATAFILE_BYTES = 10 * 1024 * 1024
 
     def initialize(api_key:, data_plane_url:, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
       raise ArgumentError, "api_key is required" if api_key.nil? || api_key.empty?
       raise ArgumentError, "data_plane_url is required" if data_plane_url.nil? || data_plane_url.empty?
 
+      assert_https_url!(data_plane_url)
+
       @api_key       = api_key
       @data_plane_url = data_plane_url.chomp("/")
-      @poll_interval = poll_interval.to_f
+      @poll_interval = [poll_interval.to_f, MIN_POLL_INTERVAL].max
       @http_client   = http_client
       @datafile      = nil
       @etag          = nil
@@ -71,6 +73,15 @@ module Feat
 
     private
 
+    def assert_https_url!(url)
+      uri = URI.parse(url)
+      return if uri.scheme == "https"
+      return if uri.scheme == "http" && %w[localhost 127.0.0.1].include?(uri.host)
+      raise ArgumentError, "data_plane_url must use https:// (http://localhost allowed for tests)"
+    rescue URI::InvalidURIError
+      raise ArgumentError, "data_plane_url is not a valid URL"
+    end
+
     def poll_loop
       until @stop
         sleep @poll_interval
@@ -98,7 +109,11 @@ module Feat
       when 304, 404
         false
       when 200
-        data = JSON.parse(res.body)
+        length = res["Content-Length"]&.to_i
+        raise "datafile exceeds maximum allowed size" if length && length > MAX_DATAFILE_BYTES
+        body = res.body
+        raise "datafile exceeds maximum allowed size" if body.bytesize > MAX_DATAFILE_BYTES
+        data = JSON.parse(body)
         new_etag = res["ETag"]
         @mutex.synchronize do
           @datafile = Datafile.from_json(data)

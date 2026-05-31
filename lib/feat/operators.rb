@@ -28,6 +28,8 @@ module Feat
         return false unless lhs.is_a?(String)
 
         any_string_value?(values) { |v|
+          next false unless safe_regex?(v)
+
           begin
             !!(lhs =~ Regexp.new(v))
           rescue RegexpError
@@ -127,6 +129,18 @@ module Feat
       end
     rescue ArgumentError
       nil
+    end
+
+    # ReDoS guard for matches_regex. Caps pattern length and rejects the
+    # most common catastrophic-backtracking shapes. False positives just
+    # turn the rule into a non-match, which is the safe default.
+    REDOS_SHAPES = /\([^)]*[+*][^)]*\)\s*[+*]|\([^)]*\|[^)]*\)\s*[+*]/
+
+    def safe_regex?(pattern)
+      return false if pattern.length > 512
+      return false if REDOS_SHAPES.match?(pattern)
+
+      true
     end
 
     SEMVER_RE = /\A(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?\z/
