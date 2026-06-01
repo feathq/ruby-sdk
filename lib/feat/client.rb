@@ -10,11 +10,6 @@ module Feat
     DEFAULT_POLL_INTERVAL = 30.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
-    # Per-address budget. Ruby 3.3's Net::HTTP picks one address from
-    # getaddrinfo and waits the full open_timeout before failing - no
-    # Happy Eyeballs - so worst-case for an N-address host is N times
-    # this value when every IP is blackholed. Kept tight on the
-    # assumption that a healthy CDN connect lands in well under a second.
     OPEN_TIMEOUT_SECONDS = 3
     READ_TIMEOUT_SECONDS = 10
     RETRYABLE_CONNECT_ERRORS = [
@@ -40,10 +35,6 @@ module Feat
       @mutex         = Mutex.new
       @stop          = false
       @thread        = nil
-      # Last IP that successfully completed a connect. Tried first on the
-      # next request to skip the per-address retry loop when the resolved
-      # set contains an unreachable IP (e.g. CF anycast pop blackholed
-      # behind some NATs). Cleared on connect failure so we re-resolve.
       @sticky_ip     = nil
     end
 
@@ -145,13 +136,9 @@ module Feat
       end
     end
 
-    # Resolves the host and tries each address in turn, falling through on
-    # connect-class errors. Net::HTTP#ipaddr= pins the connection to the
-    # chosen IP while keeping the original hostname for SNI and certificate
-    # verification. The sticky-IP fast path tries last-known-good first so
-    # steady-state polls don't pay the per-address retry cost on every
-    # request. Test seam (@http_client) bypasses everything so fakes don't
-    # have to model address selection.
+    # Net::HTTP doesn't iterate getaddrinfo results on connect failure
+    # (Ruby 3.3 has no Happy Eyeballs); ipaddr= lets us pin each attempt
+    # to a specific IP while keeping the hostname for SNI.
     def with_http_connection(uri, &block)
       if @http_client
         return @http_client.start(
@@ -167,7 +154,6 @@ module Feat
         begin
           return attempt_request(uri, sticky, &block)
         rescue *RETRYABLE_CONNECT_ERRORS
-          # Sticky IP is now unreachable - drop it and re-resolve.
           @mutex.synchronize { @sticky_ip = nil if @sticky_ip == sticky }
         end
       end
@@ -184,7 +170,7 @@ module Feat
 
       last_error = nil
       addresses.each do |ip|
-        next if ip == sticky # already tried above
+        next if ip == sticky
         begin
           result = attempt_request(uri, ip, &block)
           @mutex.synchronize { @sticky_ip = ip }
