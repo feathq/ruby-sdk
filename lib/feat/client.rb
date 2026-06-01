@@ -1,5 +1,6 @@
 require "json"
 require "net/http"
+require "socket"
 require "uri"
 require_relative "version"
 
@@ -9,11 +10,20 @@ module Feat
     DEFAULT_POLL_INTERVAL = 30.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
-    # Net::HTTP defaults to 60s for both timeouts. A transient stall would
-    # block the caller's thread for a full minute - bad behavior for an
-    # SDK that lives inside web request paths and worker queues.
-    OPEN_TIMEOUT_SECONDS = 5
+    # Per-address budget. Ruby 3.3's Net::HTTP picks one address from
+    # getaddrinfo and waits the full open_timeout before failing - no
+    # Happy Eyeballs - so worst-case for an N-address host is N times
+    # this value when every IP is blackholed. Kept tight on the
+    # assumption that a healthy CDN connect lands in well under a second.
+    OPEN_TIMEOUT_SECONDS = 3
     READ_TIMEOUT_SECONDS = 10
+    RETRYABLE_CONNECT_ERRORS = [
+      Net::OpenTimeout,
+      Errno::ETIMEDOUT,
+      Errno::ECONNREFUSED,
+      Errno::EHOSTUNREACH,
+      Errno::ENETUNREACH,
+    ].freeze
 
     def initialize(api_key:, data_plane_url:, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
       raise ArgumentError, "api_key is required" if api_key.nil? || api_key.empty?
@@ -108,14 +118,7 @@ module Feat
       req["User-Agent"] = "feat-sdk-ruby/#{Feat::VERSION}"
       @mutex.synchronize { req["If-None-Match"] = @etag if @etag }
 
-      res = (@http_client || Net::HTTP).start(
-        uri.host, uri.port,
-        use_ssl: uri.scheme == "https",
-        open_timeout: OPEN_TIMEOUT_SECONDS,
-        read_timeout: READ_TIMEOUT_SECONDS,
-      ) do |http|
-        http.request(req)
-      end
+      res = with_http_connection(uri) { |http| http.request(req) }
 
       case res.code.to_i
       when 304, 404
@@ -135,6 +138,53 @@ module Feat
       else
         raise "feat: fetch datafile failed: #{res.code}"
       end
+    end
+
+    # Resolves the host once and tries each address in turn, falling
+    # through on connect-class errors. Net::HTTP#ipaddr= pins the
+    # connection to the chosen IP while keeping the original hostname
+    # for SNI and certificate verification. Test seam (@http_client)
+    # bypasses this so fakes don't have to model address selection.
+    def with_http_connection(uri)
+      if @http_client
+        return @http_client.start(
+          uri.host, uri.port,
+          use_ssl: uri.scheme == "https",
+          open_timeout: OPEN_TIMEOUT_SECONDS,
+          read_timeout: READ_TIMEOUT_SECONDS,
+        ) { |h| yield h }
+      end
+
+      addresses = resolve_addresses(uri.host)
+      if addresses.empty?
+        return Net::HTTP.start(
+          uri.host, uri.port,
+          use_ssl: uri.scheme == "https",
+          open_timeout: OPEN_TIMEOUT_SECONDS,
+          read_timeout: READ_TIMEOUT_SECONDS,
+        ) { |h| yield h }
+      end
+
+      last_error = nil
+      addresses.each do |ip|
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.ipaddr = ip
+        http.use_ssl = (uri.scheme == "https")
+        http.open_timeout = OPEN_TIMEOUT_SECONDS
+        http.read_timeout = READ_TIMEOUT_SECONDS
+        begin
+          return http.start { |h| yield h }
+        rescue *RETRYABLE_CONNECT_ERRORS => e
+          last_error = e
+        end
+      end
+      raise last_error
+    end
+
+    def resolve_addresses(host)
+      Addrinfo.getaddrinfo(host, nil, nil, :STREAM).map(&:ip_address).uniq
+    rescue StandardError
+      []
     end
   end
 end
