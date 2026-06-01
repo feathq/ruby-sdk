@@ -105,8 +105,6 @@ module Feat
       uri = URI.parse("#{@data_plane_url}/sdk/v1/datafile")
       req = Net::HTTP::Get.new(uri)
       req["Authorization"] = "Bearer #{@api_key}"
-      # Identifies SDK traffic in data-plane logs and edge analytics. Also
-      # sidesteps generic-Python-style WAF rules that flag stdlib defaults.
       req["User-Agent"] = "feat-sdk-ruby/#{Feat::VERSION}"
       @mutex.synchronize { req["If-None-Match"] = @etag if @etag }
 
