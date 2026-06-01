@@ -1,6 +1,7 @@
 require "json"
 require "net/http"
 require "uri"
+require_relative "version"
 
 module Feat
   # Polling HTTP client. Uses stdlib only - zero gem dependencies.
@@ -8,6 +9,11 @@ module Feat
     DEFAULT_POLL_INTERVAL = 30.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
+    # Net::HTTP defaults to 60s for both timeouts. A transient stall would
+    # block the caller's thread for a full minute - bad behavior for an
+    # SDK that lives inside web request paths and worker queues.
+    OPEN_TIMEOUT_SECONDS = 5
+    READ_TIMEOUT_SECONDS = 10
 
     def initialize(api_key:, data_plane_url:, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
       raise ArgumentError, "api_key is required" if api_key.nil? || api_key.empty?
@@ -99,9 +105,17 @@ module Feat
       uri = URI.parse("#{@data_plane_url}/sdk/v1/datafile")
       req = Net::HTTP::Get.new(uri)
       req["Authorization"] = "Bearer #{@api_key}"
+      # Identifies SDK traffic in data-plane logs and edge analytics. Also
+      # sidesteps generic-Python-style WAF rules that flag stdlib defaults.
+      req["User-Agent"] = "feat-sdk-ruby/#{Feat::VERSION}"
       @mutex.synchronize { req["If-None-Match"] = @etag if @etag }
 
-      res = (@http_client || Net::HTTP).start(uri.host, uri.port, use_ssl: uri.scheme == "https") do |http|
+      res = (@http_client || Net::HTTP).start(
+        uri.host, uri.port,
+        use_ssl: uri.scheme == "https",
+        open_timeout: OPEN_TIMEOUT_SECONDS,
+        read_timeout: READ_TIMEOUT_SECONDS,
+      ) do |http|
         http.request(req)
       end
 
