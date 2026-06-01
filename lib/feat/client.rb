@@ -1,6 +1,8 @@
 require "json"
 require "net/http"
+require "socket"
 require "uri"
+require_relative "version"
 
 module Feat
   # Polling HTTP client. Uses stdlib only - zero gem dependencies.
@@ -8,6 +10,15 @@ module Feat
     DEFAULT_POLL_INTERVAL = 30.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
+    OPEN_TIMEOUT_SECONDS = 3
+    READ_TIMEOUT_SECONDS = 10
+    RETRYABLE_CONNECT_ERRORS = [
+      Net::OpenTimeout,
+      Errno::ETIMEDOUT,
+      Errno::ECONNREFUSED,
+      Errno::EHOSTUNREACH,
+      Errno::ENETUNREACH,
+    ].freeze
 
     def initialize(api_key:, data_plane_url:, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
       raise ArgumentError, "api_key is required" if api_key.nil? || api_key.empty?
@@ -24,6 +35,7 @@ module Feat
       @mutex         = Mutex.new
       @stop          = false
       @thread        = nil
+      @sticky_ip     = nil
     end
 
     # Blocking initial fetch; spawns a background poller thread.
@@ -99,11 +111,10 @@ module Feat
       uri = URI.parse("#{@data_plane_url}/sdk/v1/datafile")
       req = Net::HTTP::Get.new(uri)
       req["Authorization"] = "Bearer #{@api_key}"
+      req["User-Agent"] = "feat-sdk-ruby/#{Feat::VERSION}"
       @mutex.synchronize { req["If-None-Match"] = @etag if @etag }
 
-      res = (@http_client || Net::HTTP).start(uri.host, uri.port, use_ssl: uri.scheme == "https") do |http|
-        http.request(req)
-      end
+      res = with_http_connection(uri) { |http| http.request(req) }
 
       case res.code.to_i
       when 304, 404
@@ -123,6 +134,67 @@ module Feat
       else
         raise "feat: fetch datafile failed: #{res.code}"
       end
+    end
+
+    # Net::HTTP doesn't iterate getaddrinfo results on connect failure
+    # (Ruby 3.3 has no Happy Eyeballs); ipaddr= lets us pin each attempt
+    # to a specific IP while keeping the hostname for SNI.
+    def with_http_connection(uri, &block)
+      if @http_client
+        return @http_client.start(
+          uri.host, uri.port,
+          use_ssl: uri.scheme == "https",
+          open_timeout: OPEN_TIMEOUT_SECONDS,
+          read_timeout: READ_TIMEOUT_SECONDS,
+        ) { |h| block.call(h) }
+      end
+
+      sticky = @mutex.synchronize { @sticky_ip }
+      if sticky
+        begin
+          return attempt_request(uri, sticky, &block)
+        rescue *RETRYABLE_CONNECT_ERRORS
+          @mutex.synchronize { @sticky_ip = nil if @sticky_ip == sticky }
+        end
+      end
+
+      addresses = resolve_addresses(uri.host)
+      if addresses.empty?
+        return Net::HTTP.start(
+          uri.host, uri.port,
+          use_ssl: uri.scheme == "https",
+          open_timeout: OPEN_TIMEOUT_SECONDS,
+          read_timeout: READ_TIMEOUT_SECONDS,
+        ) { |h| block.call(h) }
+      end
+
+      last_error = nil
+      addresses.each do |ip|
+        next if ip == sticky
+        begin
+          result = attempt_request(uri, ip, &block)
+          @mutex.synchronize { @sticky_ip = ip }
+          return result
+        rescue *RETRYABLE_CONNECT_ERRORS => e
+          last_error = e
+        end
+      end
+      raise last_error
+    end
+
+    def attempt_request(uri, ip, &block)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.ipaddr = ip
+      http.use_ssl = (uri.scheme == "https")
+      http.open_timeout = OPEN_TIMEOUT_SECONDS
+      http.read_timeout = READ_TIMEOUT_SECONDS
+      http.start { |h| block.call(h) }
+    end
+
+    def resolve_addresses(host)
+      Addrinfo.getaddrinfo(host, nil, nil, :STREAM).map(&:ip_address).uniq
+    rescue StandardError
+      []
     end
   end
 end
