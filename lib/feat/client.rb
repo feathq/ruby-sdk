@@ -40,6 +40,11 @@ module Feat
       @mutex         = Mutex.new
       @stop          = false
       @thread        = nil
+      # Last IP that successfully completed a connect. Tried first on the
+      # next request to skip the per-address retry loop when the resolved
+      # set contains an unreachable IP (e.g. CF anycast pop blackholed
+      # behind some NATs). Cleared on connect failure so we re-resolve.
+      @sticky_ip     = nil
     end
 
     # Blocking initial fetch; spawns a background poller thread.
@@ -140,19 +145,31 @@ module Feat
       end
     end
 
-    # Resolves the host once and tries each address in turn, falling
-    # through on connect-class errors. Net::HTTP#ipaddr= pins the
-    # connection to the chosen IP while keeping the original hostname
-    # for SNI and certificate verification. Test seam (@http_client)
-    # bypasses this so fakes don't have to model address selection.
-    def with_http_connection(uri)
+    # Resolves the host and tries each address in turn, falling through on
+    # connect-class errors. Net::HTTP#ipaddr= pins the connection to the
+    # chosen IP while keeping the original hostname for SNI and certificate
+    # verification. The sticky-IP fast path tries last-known-good first so
+    # steady-state polls don't pay the per-address retry cost on every
+    # request. Test seam (@http_client) bypasses everything so fakes don't
+    # have to model address selection.
+    def with_http_connection(uri, &block)
       if @http_client
         return @http_client.start(
           uri.host, uri.port,
           use_ssl: uri.scheme == "https",
           open_timeout: OPEN_TIMEOUT_SECONDS,
           read_timeout: READ_TIMEOUT_SECONDS,
-        ) { |h| yield h }
+        ) { |h| block.call(h) }
+      end
+
+      sticky = @mutex.synchronize { @sticky_ip }
+      if sticky
+        begin
+          return attempt_request(uri, sticky, &block)
+        rescue *RETRYABLE_CONNECT_ERRORS
+          # Sticky IP is now unreachable - drop it and re-resolve.
+          @mutex.synchronize { @sticky_ip = nil if @sticky_ip == sticky }
+        end
       end
 
       addresses = resolve_addresses(uri.host)
@@ -162,23 +179,30 @@ module Feat
           use_ssl: uri.scheme == "https",
           open_timeout: OPEN_TIMEOUT_SECONDS,
           read_timeout: READ_TIMEOUT_SECONDS,
-        ) { |h| yield h }
+        ) { |h| block.call(h) }
       end
 
       last_error = nil
       addresses.each do |ip|
-        http = Net::HTTP.new(uri.host, uri.port)
-        http.ipaddr = ip
-        http.use_ssl = (uri.scheme == "https")
-        http.open_timeout = OPEN_TIMEOUT_SECONDS
-        http.read_timeout = READ_TIMEOUT_SECONDS
+        next if ip == sticky # already tried above
         begin
-          return http.start { |h| yield h }
+          result = attempt_request(uri, ip, &block)
+          @mutex.synchronize { @sticky_ip = ip }
+          return result
         rescue *RETRYABLE_CONNECT_ERRORS => e
           last_error = e
         end
       end
       raise last_error
+    end
+
+    def attempt_request(uri, ip, &block)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.ipaddr = ip
+      http.use_ssl = (uri.scheme == "https")
+      http.open_timeout = OPEN_TIMEOUT_SECONDS
+      http.read_timeout = READ_TIMEOUT_SECONDS
+      http.start { |h| block.call(h) }
     end
 
     def resolve_addresses(host)
