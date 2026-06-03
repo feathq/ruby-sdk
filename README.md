@@ -1,3 +1,11 @@
+<p align="center">
+  <a href="https://feat.so">
+    <img src="https://feat.so/logo/wordmark.png" alt="feat.so" width="200" />
+  </a>
+</p>
+
+---
+
 # feat-sdk
 
 Server-side Ruby SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Standard library only - no gem dependencies.
