@@ -2,7 +2,7 @@ Gem::Specification.new do |spec|
   spec.name          = "feat-sdk"
   spec.version       = "0.1.0"
   spec.authors       = ["feat HQ"]
-  spec.email         = ["engineering@feat.so"]
+  spec.email         = ["support@feat.so"]
   spec.summary       = "feat feature-flag SDK for Ruby (server-side, local evaluation)"
   spec.description   = "Server-side Ruby SDK for feat. Polls a per-environment datafile and evaluates flags locally with no per-flag network call. Stdlib only."
   spec.homepage      = "https://feat.so"
