@@ -1,6 +1,8 @@
+require_relative "lib/feat/version"
+
 Gem::Specification.new do |spec|
   spec.name          = "feat-sdk"
-  spec.version       = "0.1.0"
+  spec.version       = Feat::VERSION
   spec.authors       = ["feat HQ"]
   spec.email         = ["support@feat.so"]
   spec.summary       = "feat feature-flag SDK for Ruby (server-side, local evaluation)"
