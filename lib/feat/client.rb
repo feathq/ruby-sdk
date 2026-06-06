@@ -7,6 +7,7 @@ require_relative "version"
 module Feat
   # Polling HTTP client. Uses stdlib only - zero gem dependencies.
   class Client
+    DEFAULT_URL = "https://data-01.feat.so"
     DEFAULT_POLL_INTERVAL = 30.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
@@ -20,14 +21,13 @@ module Feat
       Errno::ENETUNREACH,
     ].freeze
 
-    def initialize(api_key:, data_plane_url:, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
+    def initialize(api_key:, url: DEFAULT_URL, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
       raise ArgumentError, "api_key is required" if api_key.nil? || api_key.empty?
-      raise ArgumentError, "data_plane_url is required" if data_plane_url.nil? || data_plane_url.empty?
 
-      assert_https_url!(data_plane_url)
+      assert_https_url!(url)
 
       @api_key       = api_key
-      @data_plane_url = data_plane_url.chomp("/")
+      @url           = url.chomp("/")
       @poll_interval = [poll_interval.to_f, MIN_POLL_INTERVAL].max
       @http_client   = http_client
       @datafile      = nil
@@ -89,9 +89,9 @@ module Feat
       uri = URI.parse(url)
       return if uri.scheme == "https"
       return if uri.scheme == "http" && %w[localhost 127.0.0.1].include?(uri.host)
-      raise ArgumentError, "data_plane_url must use https:// (http://localhost allowed for tests)"
+      raise ArgumentError, "url must use https:// (http://localhost allowed for tests)"
     rescue URI::InvalidURIError
-      raise ArgumentError, "data_plane_url is not a valid URL"
+      raise ArgumentError, "url is not a valid URL"
     end
 
     def poll_loop
@@ -108,7 +108,7 @@ module Feat
     end
 
     def fetch_once
-      uri = URI.parse("#{@data_plane_url}/sdk/v1/datafile")
+      uri = URI.parse("#{@url}/sdk/v1/datafile")
       req = Net::HTTP::Get.new(uri)
       req["Authorization"] = "Bearer #{@api_key}"
       req["User-Agent"] = "feat-sdk-ruby/#{Feat::VERSION}"

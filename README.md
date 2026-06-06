@@ -30,7 +30,7 @@ require "feat"
 
 client = Feat::Client.new(
   api_key: ENV.fetch("FEAT_SERVER_KEY"),
-  data_plane_url: "https://data.feat.so",
+  url: "https://data-01.feat.so", # optional; this is the default
 )
 client.start
 
