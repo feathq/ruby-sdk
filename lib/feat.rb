@@ -5,6 +5,8 @@ require "feat/bucketing"
 require "feat/operators"
 require "feat/segments"
 require "feat/eval"
+require "feat/sse"
+require "feat/streaming"
 require "feat/client"
 
 # Feat - feature-flag SDK for Ruby.

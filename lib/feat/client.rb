@@ -3,16 +3,29 @@ require "net/http"
 require "socket"
 require "uri"
 require_relative "version"
+require_relative "sse"
+require_relative "streaming"
 
 module Feat
-  # Polling HTTP client. Uses stdlib only - zero gem dependencies.
+  # HTTP client. Uses stdlib only - zero gem dependencies.
+  #
+  # By default the client streams datafile updates over Server-Sent Events
+  # and keeps a slow background poll as a safety net. Disable streaming with
+  # `streaming: false` to fall back to polling alone.
   class Client
+    include InterruptibleSleep
+
     DEFAULT_URL = "https://data-01.feat.so"
     DEFAULT_POLL_INTERVAL = 30.0
+    # When streaming carries updates, the poll is a backstop only and runs
+    # far less often.
+    DEFAULT_SAFETY_POLL_INTERVAL = 300.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
     OPEN_TIMEOUT_SECONDS = 3
     READ_TIMEOUT_SECONDS = 10
+    # Long-lived stream read: heartbeat comments keep it well under this.
+    STREAM_READ_TIMEOUT_SECONDS = 90
     RETRYABLE_CONNECT_ERRORS = [
       Net::OpenTimeout,
       Errno::ETIMEDOUT,
@@ -21,31 +34,40 @@ module Feat
       Errno::ENETUNREACH,
     ].freeze
 
-    def initialize(api_key:, url: DEFAULT_URL, poll_interval: DEFAULT_POLL_INTERVAL, http_client: nil)
+    def initialize(api_key:, url: DEFAULT_URL, poll_interval: DEFAULT_POLL_INTERVAL,
+                   streaming: true, safety_poll_interval: DEFAULT_SAFETY_POLL_INTERVAL,
+                   http_client: nil, stream_transport: nil)
       raise ArgumentError, "api_key is required" if api_key.nil? || api_key.empty?
 
       assert_https_url!(url)
 
-      @api_key       = api_key
-      @url           = url.chomp("/")
-      @poll_interval = [poll_interval.to_f, MIN_POLL_INTERVAL].max
-      @http_client   = http_client
-      @datafile      = nil
-      @etag          = nil
-      @mutex         = Mutex.new
-      @stop          = false
-      @thread        = nil
-      @sticky_ip     = nil
+      @api_key           = api_key
+      @url               = url.chomp("/")
+      @streaming_enabled = streaming
+      base_interval      = streaming ? safety_poll_interval : poll_interval
+      @poll_interval     = [base_interval.to_f, MIN_POLL_INTERVAL].max
+      @http_client       = http_client
+      @datafile          = nil
+      @etag              = nil
+      @mutex             = Mutex.new
+      @stop              = false
+      @thread            = nil
+      @sticky_ip         = nil
+      @streaming         = build_streaming_client(stream_transport) if @streaming_enabled
     end
 
-    # Blocking initial fetch; spawns a background poller thread.
+    # Blocking initial fetch; spawns the background poller (and stream).
     def start
       refresh
+      @streaming&.start
       @thread ||= Thread.new { poll_loop }
+      self
     end
 
     def close
       @stop = true
+      @streaming&.stop
+      self
     end
 
     def refresh
@@ -94,9 +116,24 @@ module Feat
       raise ArgumentError, "url is not a valid URL"
     end
 
+    # Builds the streaming client; its `put` handler runs through the same
+    # version-guarded store as polling, so an older frame never wins.
+    def build_streaming_client(transport)
+      transport ||= NetHTTPStreamTransport.new(
+        open_timeout: OPEN_TIMEOUT_SECONDS,
+        read_timeout: STREAM_READ_TIMEOUT_SECONDS,
+      )
+      StreamingClient.new(
+        url: @url,
+        api_key: @api_key,
+        transport: transport,
+        on_put: ->(parsed) { store_datafile(parsed, parsed["etag"]) },
+      )
+    end
+
     def poll_loop
       until @stop
-        sleep @poll_interval
+        interruptible_sleep(@poll_interval) { @stop }
         break if @stop
 
         begin
@@ -124,16 +161,26 @@ module Feat
         raise "datafile exceeds maximum allowed size" if length && length > MAX_DATAFILE_BYTES
         body = res.body
         raise "datafile exceeds maximum allowed size" if body.bytesize > MAX_DATAFILE_BYTES
-        data = JSON.parse(body)
-        new_etag = res["ETag"]
-        @mutex.synchronize do
-          @datafile = Datafile.from_json(data)
-          @etag = new_etag if new_etag
-        end
-        true
+        store_datafile(JSON.parse(body), res["ETag"])
       else
         raise "feat: fetch datafile failed: #{res.code}"
       end
+    end
+
+    # Adopt a parsed datafile only if its version is strictly newer than the
+    # one in memory. Shared by the poll and stream paths and guarded by the
+    # same mutex the evaluator reads through. Returns true when adopted.
+    def store_datafile(parsed, etag)
+      candidate = Datafile.from_json(parsed)
+      @mutex.synchronize do
+        current_version = @datafile&.version
+        new_version = candidate.version
+        return false if new_version && current_version && new_version <= current_version
+
+        @datafile = candidate
+        @etag = etag if etag
+      end
+      true
     end
 
     # Net::HTTP doesn't iterate getaddrinfo results on connect failure
