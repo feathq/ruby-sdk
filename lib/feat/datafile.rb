@@ -49,6 +49,36 @@ module Feat
       )
     end
 
+    # Merge a patch delta onto an existing File and return a new File. Pure:
+    # +current+ is not mutated. Added or changed flags/segments are built
+    # from their wire objects and override by key; removed keys are dropped.
+    # version, etag, and generatedAt advance to the patch's values (etag and
+    # generatedAt fall back to the current ones when the patch omits them).
+    # Raises if a flag or segment object is malformed; the caller treats that
+    # as a no-op and ignores the patch.
+    def self.merge_patch(current, patch)
+      flags = current.flags.dup
+      (patch["flags"] || {}).each { |k, v| flags[k] = build_flag(v) }
+      (patch["removedFlags"] || []).each { |k| flags.delete(k) }
+
+      segments = current.segments.dup
+      (patch["segments"] || {}).each { |k, v| segments[k] = build_segment(v) }
+      (patch["removedSegments"] || []).each { |k| segments.delete(k) }
+
+      File.new(
+        schemaVersion: current.schemaVersion,
+        envId:         current.envId,
+        envKey:        current.envKey,
+        projectId:     current.projectId,
+        version:       patch["to"],
+        etag:          patch["etag"] || current.etag,
+        generatedAt:   patch["generatedAt"] || current.generatedAt,
+        flags:         flags,
+        segments:      segments,
+        contextKinds:  current.contextKinds
+      )
+    end
+
     def self.build_flag(d)
       FlagSpec.new(
         id:                             d["id"],

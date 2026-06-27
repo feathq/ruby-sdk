@@ -135,7 +135,30 @@ module Feat
         api_key: @api_key,
         transport: transport,
         on_put: ->(parsed) { store_datafile(parsed, parsed["etag"]) },
+        on_patch: ->(parsed) { apply_patch(parsed) },
       )
+    end
+
+    # Apply a streamed `patch` delta. Version-gated: the delta is merged only
+    # when the in-memory datafile's version equals the patch's +from+, so the
+    # result is exactly the +to+ snapshot. On any gap or mismatch the patch is
+    # ignored - a reconnect reseeds a full `put` and the safety poll backstops.
+    # Runs under the same mutex as store_datafile, so a subsequent evaluation
+    # sees the merged delta atomically. Returns true when applied.
+    def apply_patch(patch)
+      from = patch["from"]
+      to   = patch["to"]
+      return false if from.nil? || to.nil?
+
+      @mutex.synchronize do
+        current = @datafile
+        return false if current.nil?
+        return false unless current.version == from
+
+        @datafile = Datafile.merge_patch(current, patch)
+        @etag = patch["etag"] if patch["etag"]
+      end
+      true
     end
 
     def poll_loop

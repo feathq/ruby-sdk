@@ -204,6 +204,43 @@ class StreamingTest < Minitest::Test
     client&.stop
   end
 
+  def test_dispatches_patch_to_on_patch
+    patches = Queue.new
+    puts_seen = Queue.new
+    frame = "event: patch\nid: 6\ndata: {\"from\":5,\"to\":6}\n\n"
+    transport = FakeStreamTransport.new { |_| FakeStreamConnection.new([frame]) }
+    client = Feat::StreamingClient.new(
+      url: "https://example.test", api_key: "k", transport: transport,
+      on_put: ->(p) { puts_seen << p }, on_patch: ->(p) { patches << p },
+      initial_backoff: 0.01, max_backoff: 0.05
+    )
+    client.start
+
+    parsed = wait_until { patches.empty? ? nil : patches.pop }
+    assert_equal 5, parsed["from"]
+    assert_equal 6, parsed["to"]
+    assert puts_seen.empty?, "a patch frame must not be delivered to on_put"
+  ensure
+    client&.stop
+  end
+
+  def test_patch_without_on_patch_is_a_noop
+    # on_patch defaults to nil; a patch frame must be a silent no-op, not a
+    # crash, and must not be mistaken for a put.
+    puts_seen = Queue.new
+    errors = Queue.new
+    frame = "event: patch\nid: 2\ndata: {\"from\":1,\"to\":2}\n\nevent: put\ndata: {\"version\":9}\n\n"
+    transport = FakeStreamTransport.new { |_| FakeStreamConnection.new([frame]) }
+    client = build(transport, puts_seen: puts_seen, errors: errors)
+    client.start
+
+    parsed = wait_until { puts_seen.empty? ? nil : puts_seen.pop }
+    assert_equal 9, parsed["version"], "the put after a no-op patch must still be dispatched"
+    assert errors.empty?, "a patch with no on_patch handler must not surface an error"
+  ensure
+    client&.stop
+  end
+
   def test_malformed_data_is_ignored
     puts_seen = Queue.new
     errors = Queue.new

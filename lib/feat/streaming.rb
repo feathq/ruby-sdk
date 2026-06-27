@@ -87,8 +87,9 @@ module Feat
   end
 
   # Holds a long-lived SSE connection to the datafile stream endpoint and
-  # invokes +on_put+ with the parsed datafile for every `put` frame. Runs on
-  # its own thread, reconnects with exponential backoff, and stops cleanly.
+  # invokes +on_put+ with the parsed datafile for every `put` frame and
+  # +on_patch+ with the parsed delta for every `patch` frame. Runs on its
+  # own thread, reconnects with exponential backoff, and stops cleanly.
   class StreamingClient
     include InterruptibleSleep
 
@@ -106,7 +107,7 @@ module Feat
     TERMINAL_STREAM_CODES = [401, 403].freeze
     JOIN_TIMEOUT_SECONDS = 5
 
-    def initialize(url:, api_key:, transport:, on_put:, on_error: nil,
+    def initialize(url:, api_key:, transport:, on_put:, on_patch: nil, on_error: nil,
                    initial_backoff: DEFAULT_INITIAL_BACKOFF,
                    max_backoff: DEFAULT_MAX_BACKOFF,
                    min_uptime: DEFAULT_MIN_UPTIME,
@@ -115,6 +116,7 @@ module Feat
       @api_key         = api_key
       @transport       = transport
       @on_put          = on_put
+      @on_patch        = on_patch
       @on_error        = on_error
       @initial_backoff = initial_backoff
       @max_backoff     = max_backoff
@@ -213,8 +215,19 @@ module Feat
     end
 
     def handle_event(event)
-      return unless event[:event] == "put"
+      case event[:event]
+      when "put"   then with_parsed_payload(event) { |parsed| @on_put.call(parsed) }
+      when "patch" then with_parsed_payload(event) { |parsed| @on_patch&.call(parsed) }
+      end
+    rescue StandardError => e
+      notify_error(e)
+    end
 
+    # Decode the event's JSON data field and hand it to the block. A missing,
+    # empty, or unparseable payload is dropped silently (the next frame or a
+    # reconnect recovers); any error the block raises bubbles to the caller's
+    # rescue and is surfaced via on_error.
+    def with_parsed_payload(event)
       raw = event[:data]
       return if raw.nil? || raw.empty?
 
@@ -225,9 +238,7 @@ module Feat
           return
         end
 
-      @on_put.call(parsed)
-    rescue StandardError => e
-      notify_error(e)
+      yield parsed
     end
 
     # We deliberately do not send a Last-Event-ID header to resume. The
