@@ -122,6 +122,32 @@ class FakeHTTPClient
   end
 end
 
+# Polling http_client that records each request's If-None-Match header and
+# serves a queued response per request. Lets a test assert conditional-GET
+# freshness: the poll after a patch carries the patched etag.
+class RecordingHTTPClient
+  attr_reader :if_none_match_seen
+
+  def initialize(responses)
+    @responses          = responses
+    @if_none_match_seen = []
+    @mutex              = Mutex.new
+  end
+
+  def start(*_args, **_kwargs)
+    yield self
+  end
+
+  def request(req)
+    @mutex.synchronize do
+      @if_none_match_seen << req["If-None-Match"]
+      raise "RecordingHTTPClient: no more responses queued" if @responses.empty?
+
+      @responses.shift
+    end
+  end
+end
+
 # Polling http_client whose Nth request blocks until released, so a test can
 # park the poll thread mid-fetch_once and verify close() joins it. The first
 # request (the synchronous initial refresh) returns immediately.

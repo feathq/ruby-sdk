@@ -148,7 +148,11 @@ module Feat
     def apply_patch(patch)
       from = patch["from"]
       to   = patch["to"]
-      return false if from.nil? || to.nil?
+      # Reject malformed or out-of-order deltas before touching the datafile:
+      # both bounds must be integers and the patch must move strictly forward.
+      # Without the `to > from` guard a backward `to` would roll the in-memory
+      # version backward and break version ordering.
+      return false unless from.is_a?(Integer) && to.is_a?(Integer) && to > from
 
       @mutex.synchronize do
         current = @datafile

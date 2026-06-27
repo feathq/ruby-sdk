@@ -214,6 +214,123 @@ class ClientTest < Minitest::Test
     client&.close
   end
 
+  def test_streaming_patch_forward_gap_is_ignored_then_resyncs
+    # Seed v1. A patch from:5 to:6 is a forward gap (the client is behind the
+    # patch base), so it must be ignored rather than applied on the wrong base.
+    # A later poll reseed at v6 still recovers, proving the client is not wedged.
+    http = http_serving(
+      datafile_hash(version: 1, default_id: "off"),
+      datafile_hash(version: 6, default_id: "on"),
+    )
+    patch = patch_frame(from: 5, to: 6, flags: { "checkout" => flag_hash(default_id: "on") })
+    transport = FakeStreamTransport.new { |_| FakeStreamConnection.new([patch]) }
+    client = Feat::Client.new(api_key: "k", url: "https://example.test", http_client: http, stream_transport: transport)
+    client.start
+
+    sleep 0.1 # let the stream thread process the (ignored) forward-gap patch
+    assert_equal 1, client.instance_variable_get(:@datafile).version,
+                 "a forward-gap patch (from ahead of current version) must be ignored"
+    assert_equal false, client.get_boolean_value("checkout", false, ctx)
+
+    client.refresh # poll reseeds the full datafile at v6
+    assert_equal 6, client.instance_variable_get(:@datafile).version,
+                 "a poll reseed must recover after an ignored forward-gap patch"
+    assert_equal true, client.get_boolean_value("checkout", false, ctx)
+  ensure
+    client&.close
+  end
+
+  def test_streaming_patch_with_to_not_greater_than_from_is_ignored
+    # Seed v5. A patch whose base matches (from:5) but whose target rolls
+    # backward (to:4) must be rejected: applying it would move the datafile
+    # version backward and break version ordering.
+    http = http_serving(datafile_hash(version: 5, default_id: "on"))
+    patch = patch_frame(from: 5, to: 4, flags: { "checkout" => flag_hash(default_id: "off") })
+    transport = FakeStreamTransport.new { |_| FakeStreamConnection.new([patch]) }
+    client = Feat::Client.new(api_key: "k", url: "https://example.test", http_client: http, stream_transport: transport)
+    client.start
+
+    sleep 0.1 # let the stream thread process the (rejected) backward patch
+    assert_equal 5, client.instance_variable_get(:@datafile).version,
+                 "a patch with to <= from must not roll the datafile version backward"
+    assert_equal true, client.get_boolean_value("checkout", false, ctx),
+                 "the rejected patch must not change evaluation"
+  ensure
+    client&.close
+  end
+
+  def test_streaming_patch_replayed_is_a_noop_the_second_time
+    # The same from:1 to:2 patch delivered twice: the first applies (version
+    # advances to 2), the second no longer lines up (current is now 2, not 1)
+    # so it is a silent no-op rather than reapplied.
+    http = http_serving(datafile_hash(version: 1, default_id: "off"))
+    patch = patch_frame(from: 1, to: 2, flags: { "checkout" => flag_hash(default_id: "on") })
+    transport = FakeStreamTransport.new { |_| FakeStreamConnection.new([patch + patch]) }
+    client = Feat::Client.new(api_key: "k", url: "https://example.test", http_client: http, stream_transport: transport)
+    client.start
+
+    became_true = wait_until { client.get_boolean_value("checkout", false, ctx) == true }
+    assert became_true, "the first patch should apply"
+    sleep 0.1 # let the duplicate frame be processed
+    assert_equal 2, client.instance_variable_get(:@datafile).version,
+                 "replaying the same patch must be a no-op, not advance the version again"
+  ensure
+    client&.close
+  end
+
+  def test_patch_before_any_datafile_is_ignored
+    # apply_patch must early-return when no datafile has been seeded yet
+    # (current.nil?) instead of raising or building a file from nothing.
+    client = Feat::Client.new(api_key: "k", url: "https://example.test",
+                              streaming: false, http_client: FakeHTTPClient.new([]))
+    applied = client.send(:apply_patch, "from" => 1, "to" => 2, "flags" => {})
+    refute applied, "a patch with no datafile in memory must be ignored"
+    assert_nil client.instance_variable_get(:@datafile)
+  ensure
+    client&.close
+  end
+
+  def test_patch_with_missing_or_non_integer_versions_is_ignored
+    # Both from and to must be integers; a missing, string, or float value is
+    # rejected before any merge is attempted.
+    http = http_serving(datafile_hash(version: 1, default_id: "off"))
+    client = Feat::Client.new(api_key: "k", url: "https://example.test", streaming: false, http_client: http)
+    client.start
+
+    refute client.send(:apply_patch, "to" => 2, "flags" => {}), "missing from is rejected"
+    refute client.send(:apply_patch, "from" => 1, "flags" => {}), "missing to is rejected"
+    refute client.send(:apply_patch, "from" => "1", "to" => 2, "flags" => {}), "non-integer from is rejected"
+    refute client.send(:apply_patch, "from" => 1, "to" => 2.5, "flags" => {}), "non-integer to is rejected"
+    assert_equal 1, client.instance_variable_get(:@datafile).version,
+                 "no rejected patch may change the in-memory version"
+  ensure
+    client&.close
+  end
+
+  def test_poll_after_patch_sends_new_etag_and_gets_304
+    # After a patch advances the etag, the next poll must issue a conditional
+    # GET carrying the new etag and accept the 304 (not-modified) it gets back,
+    # leaving the patched datafile in place.
+    http = RecordingHTTPClient.new([
+      FakeHTTPResponse.new(code: 200, body: JSON.generate(datafile_hash(version: 1, default_id: "off")), headers: { "ETag" => "etag-1" }),
+      FakeHTTPResponse.new(code: 304, body: "", headers: {}),
+    ])
+    patch = patch_frame(from: 1, to: 2, flags: { "checkout" => flag_hash(default_id: "on") }, etag: "etag-2")
+    transport = FakeStreamTransport.new { |_| FakeStreamConnection.new([patch]) }
+    client = Feat::Client.new(api_key: "k", url: "https://example.test", http_client: http, stream_transport: transport)
+    client.start
+
+    wait_until { client.instance_variable_get(:@etag) == "etag-2" } # patch bumps the etag
+    client.refresh # conditional GET with the patched etag -> 304
+
+    assert_includes http.if_none_match_seen, "etag-2",
+                    "the poll after a patch must send If-None-Match with the patched etag"
+    assert_equal 2, client.instance_variable_get(:@datafile).version,
+                 "a 304 leaves the patched datafile in place"
+  ensure
+    client&.close
+  end
+
   def test_polling_fallback_version_guard_when_streaming_disabled
     # No stream; three sequential polls: v1, then v3, then a stale v2.
     http = http_serving(
