@@ -8,7 +8,7 @@
 
 # feat Ruby SDK
 
-Server-side Ruby SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Standard library only - no gem dependencies.
+Server-side Ruby SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a live-streamed datafile. Standard library only - no gem dependencies.
 
 ## Install
 
@@ -51,9 +51,30 @@ Use a **server** API key (`feat_sdk_...`).
 ## How it works
 
 - Fetches a per-environment datafile and keeps it in memory.
-- Polls every 30 seconds by default. ETag-aware via `If-None-Match`.
+- Streams updates over Server-Sent Events: a background thread holds an open
+  connection and applies each new datafile the instant it changes. Updates are
+  version-ordered (an older or equal datafile is never adopted) and guarded by a
+  mutex shared with the evaluator.
+- Keeps a slow background poll (every 5 minutes by default) as a safety net.
+  ETag-aware via `If-None-Match`. If the stream drops, it reconnects with
+  exponential backoff while the poll keeps the datafile fresh.
 - Evaluation runs in-process: no per-flag network call.
-- A background thread handles polling; `close` stops it cleanly.
+- `close` stops the stream and poll threads cleanly.
+
+### Streaming options
+
+Streaming is on by default. To disable it and rely on polling alone:
+
+```ruby
+client = Feat::Client.new(
+  api_key: ENV.fetch("FEAT_SERVER_KEY"),
+  streaming: false,        # poll-only mode
+  poll_interval: 30,       # seconds (used when streaming is off)
+)
+```
+
+When streaming is on, `safety_poll_interval:` (default 300 seconds) controls the
+backstop poll cadence.
 
 ## License
 
