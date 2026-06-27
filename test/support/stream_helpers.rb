@@ -27,6 +27,26 @@ class FakeStreamConnection
   end
 end
 
+# Yields its chunks then returns immediately, mimicking a server that seeds
+# data on connect and drops the stream without holding it open. Used to
+# exercise the min-uptime backoff guard.
+class DroppingStreamConnection
+  attr_reader :closed
+
+  def initialize(chunks)
+    @chunks = chunks
+    @closed = false
+  end
+
+  def each_chunk
+    @chunks.each { |chunk| yield chunk }
+  end
+
+  def close
+    @closed = true
+  end
+end
+
 # Connection that raises the moment it is read, to exercise reconnect paths.
 class RaisingStreamConnection
   def initialize(error)
@@ -43,13 +63,14 @@ end
 # Records connect attempts and delegates to a block that decides what each
 # attempt produces (a connection, or a raise).
 class FakeStreamTransport
-  attr_reader :connect_count, :headers_seen, :uris_seen
+  attr_reader :connect_count, :headers_seen, :uris_seen, :connect_times
 
   def initialize(&behavior)
     @behavior      = behavior
     @connect_count = 0
     @headers_seen  = []
     @uris_seen     = []
+    @connect_times = []
     @mutex         = Mutex.new
   end
 
@@ -59,6 +80,7 @@ class FakeStreamTransport
       @connect_count += 1
       @headers_seen << headers
       @uris_seen << uri
+      @connect_times << Process.clock_gettime(Process::CLOCK_MONOTONIC)
       attempt = @connect_count
     end
     @behavior.call(attempt)
@@ -97,6 +119,39 @@ class FakeHTTPClient
 
       @responses.shift
     end
+  end
+end
+
+# Polling http_client whose Nth request blocks until released, so a test can
+# park the poll thread mid-fetch_once and verify close() joins it. The first
+# request (the synchronous initial refresh) returns immediately.
+class BlockingHTTPClient
+  def initialize(first_body:, headers: {}, block_on: 2)
+    @first    = FakeHTTPResponse.new(code: 200, body: first_body, headers: headers)
+    @block_on = block_on
+    @entered  = Queue.new # signals the test that a blocking request started
+    @release  = Queue.new # the test pushes here to let the request return
+    @count    = 0
+    @mutex    = Mutex.new
+  end
+
+  attr_reader :entered
+
+  def release!
+    @release << :go
+  end
+
+  def start(*_args, **_kwargs)
+    yield self
+  end
+
+  def request(_req)
+    n = @mutex.synchronize { @count += 1 }
+    return @first if n < @block_on
+
+    @entered << :now
+    @release.pop
+    @first
   end
 end
 

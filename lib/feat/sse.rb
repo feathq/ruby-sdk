@@ -1,4 +1,9 @@
 module Feat
+  # Raised when a single SSE event (its in-flight buffer plus accumulated
+  # data) grows past the configured byte cap. Aborts the connection rather
+  # than letting a missing newline or a giant data field exhaust memory.
+  class SSEOverflowError < StandardError; end
+
   # Incremental Server-Sent Events parser. Pure: it does no IO.
   #
   # Feed raw response bytes with #feed; the parser buffers, splits on
@@ -13,7 +18,13 @@ module Feat
   #   - A blank line dispatches the pending event.
   #   - Lines starting with ":" are comments (heartbeats) and are ignored.
   class SSEParser
-    def initialize
+    # Upper bound on the bytes held for one in-progress event. Mirrors
+    # Client::MAX_DATAFILE_BYTES so the stream path is bounded the same way
+    # the poll path is.
+    MAX_EVENT_BYTES = 10 * 1024 * 1024
+
+    def initialize(max_event_bytes: MAX_EVENT_BYTES)
+      @max_event_bytes = max_event_bytes
       @buffer = +""
       reset_event
     end
@@ -26,9 +37,20 @@ module Feat
         # String#chomp strips a trailing "\r\n", "\n", or "\r".
         process_line(line.chomp) { |event| yield event }
       end
+      # A line that never terminates, or a single oversized data field, must
+      # not grow the buffers without bound. Abort once past the cap.
+      guard_size!
     end
 
     private
+
+    def guard_size!
+      buffered = @buffer.bytesize
+      @data.each { |segment| buffered += segment.bytesize }
+      return if buffered <= @max_event_bytes
+
+      raise SSEOverflowError, "SSE event exceeds #{@max_event_bytes} bytes"
+    end
 
     def process_line(line)
       if line.empty?

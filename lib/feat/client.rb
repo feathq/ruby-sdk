@@ -26,6 +26,9 @@ module Feat
     READ_TIMEOUT_SECONDS = 10
     # Long-lived stream read: heartbeat comments keep it well under this.
     STREAM_READ_TIMEOUT_SECONDS = 90
+    # Bound on how long #close waits for the poll thread to unwind, so a
+    # blocked fetch cannot make shutdown hang indefinitely.
+    POLL_JOIN_TIMEOUT_SECONDS = 5
     RETRYABLE_CONNECT_ERRORS = [
       Net::OpenTimeout,
       Errno::ETIMEDOUT,
@@ -67,6 +70,10 @@ module Feat
     def close
       @stop = true
       @streaming&.stop
+      # Join the poll thread (bounded) so a fetch in flight is waited out and
+      # @thread is cleared, leaving the client cleanly restartable.
+      @thread&.join(POLL_JOIN_TIMEOUT_SECONDS)
+      @thread = nil
       self
     end
 

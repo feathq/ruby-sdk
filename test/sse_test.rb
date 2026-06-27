@@ -61,6 +61,26 @@ class SSETest < Minitest::Test
     assert_equal "2", events[1][:data]
   end
 
+  def test_raises_when_unterminated_line_exceeds_cap
+    parser = Feat::SSEParser.new(max_event_bytes: 64)
+    assert_raises(Feat::SSEOverflowError) do
+      parser.feed("data: " + ("x" * 200)) { |_| }
+    end
+  end
+
+  def test_raises_when_accumulated_data_exceeds_cap
+    parser = Feat::SSEParser.new(max_event_bytes: 64)
+    assert_raises(Feat::SSEOverflowError) do
+      10.times { parser.feed("data: #{"y" * 20}\n") { |_| } }
+    end
+  end
+
+  def test_within_cap_does_not_raise
+    parser = Feat::SSEParser.new(max_event_bytes: 1024)
+    events = collect(parser, "event: put\ndata: {\"version\":1}\n\n")
+    assert_equal 1, events.length
+  end
+
   def test_tolerates_crlf_line_endings
     parser = Feat::SSEParser.new
     events = collect(parser, "event: put\r\ndata: ok\r\n\r\n")

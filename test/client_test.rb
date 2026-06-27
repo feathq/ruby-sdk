@@ -135,6 +135,38 @@ class ClientTest < Minitest::Test
     assert_equal before, transport.connect_count, "no reconnects expected after close"
   end
 
+  # Temporarily lower the poll-interval floor so the background poll thread
+  # reaches its first fetch quickly instead of after the 5s production floor.
+  def with_min_poll_interval(value)
+    original = Feat::Client::MIN_POLL_INTERVAL
+    Feat::Client.send(:remove_const, :MIN_POLL_INTERVAL)
+    Feat::Client.const_set(:MIN_POLL_INTERVAL, value)
+    yield
+  ensure
+    Feat::Client.send(:remove_const, :MIN_POLL_INTERVAL)
+    Feat::Client.const_set(:MIN_POLL_INTERVAL, original)
+  end
+
+  def test_close_joins_poll_thread_blocked_in_fetch
+    with_min_poll_interval(0.01) do
+      body = JSON.generate(datafile_hash(version: 1, default_id: "off"))
+      http = BlockingHTTPClient.new(first_body: body, headers: { "ETag" => "e1" })
+      client = Feat::Client.new(api_key: "k", url: "https://example.test",
+                                streaming: false, poll_interval: 0.01, http_client: http)
+      client.start
+      http.entered.pop # poll thread is now parked inside fetch_once
+
+      # close() sets @stop then joins the poll thread; the thread is blocked in
+      # fetch, so keep releasing it until close returns. With @stop already set,
+      # the poll loop exits the next time a fetch unblocks.
+      closer = Thread.new { client.close }
+      http.release! until closer.join(0.05)
+
+      assert closer.value, "close returned (did not hang on the blocked poll)"
+      assert_nil client.instance_variable_get(:@thread), "expected @thread cleared after close"
+    end
+  end
+
   def test_evaluate_before_start_returns_default
     client = Feat::Client.new(api_key: "k", url: "https://example.test", streaming: false, http_client: FakeHTTPClient.new([]))
     result = client.evaluate("checkout", "fallback", ctx)

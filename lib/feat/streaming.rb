@@ -5,8 +5,18 @@ require_relative "version"
 require_relative "sse"
 
 module Feat
-  # Raised when the stream endpoint answers with a non-200 status.
-  class StreamError < StandardError; end
+  # Raised when the stream endpoint answers with a non-200 status. +code+
+  # carries the HTTP status so the run loop can tell terminal auth failures
+  # (401 invalid/revoked/expired key, 403 origin not allowed) apart from
+  # retryable ones (429 rate limit, 5xx).
+  class StreamError < StandardError
+    attr_reader :code
+
+    def initialize(message, code: nil)
+      super(message)
+      @code = code
+    end
+  end
 
   # Sleeps that wake promptly when a stop flag flips, so background threads
   # shut down without waiting out a full interval.
@@ -62,7 +72,7 @@ module Feat
       def each_chunk
         @http.request(@request) do |response|
           code = response.code.to_i
-          raise StreamError, "datafile stream failed: HTTP #{code}" unless code == 200
+          raise StreamError.new("datafile stream failed: HTTP #{code}", code: code) unless code == 200
 
           response.read_body { |chunk| yield chunk }
         end
@@ -85,11 +95,22 @@ module Feat
     PATH = "/sdk/v1/datafile/stream".freeze
     DEFAULT_INITIAL_BACKOFF = 1.0
     DEFAULT_MAX_BACKOFF = 60.0
+    # A connection must stay open at least this long before we treat it as
+    # healthy and reset backoff. The server seeds a `put` on every
+    # (re)connect, so "an event arrived" alone does not prove the connection
+    # is stable: a server that seeds then immediately drops would otherwise
+    # pin us to a fixed ~1s reconnect cadence forever.
+    DEFAULT_MIN_UPTIME = 5.0
+    # HTTP statuses that will never succeed with this key/origin, so we stop
+    # retrying: 401 (invalid/revoked/expired key), 403 (origin not allowed).
+    TERMINAL_STREAM_CODES = [401, 403].freeze
     JOIN_TIMEOUT_SECONDS = 5
 
     def initialize(url:, api_key:, transport:, on_put:, on_error: nil,
                    initial_backoff: DEFAULT_INITIAL_BACKOFF,
-                   max_backoff: DEFAULT_MAX_BACKOFF)
+                   max_backoff: DEFAULT_MAX_BACKOFF,
+                   min_uptime: DEFAULT_MIN_UPTIME,
+                   max_event_bytes: SSEParser::MAX_EVENT_BYTES)
       @url             = url.chomp("/")
       @api_key         = api_key
       @transport       = transport
@@ -97,6 +118,8 @@ module Feat
       @on_error        = on_error
       @initial_backoff = initial_backoff
       @max_backoff     = max_backoff
+      @min_uptime      = min_uptime
+      @max_event_bytes = max_event_bytes
       @mutex           = Mutex.new
       @conn            = nil
       @thread          = nil
@@ -127,37 +150,55 @@ module Feat
     def run_loop
       backoff = @initial_backoff
       until @stop
-        received = false
+        started_at = monotonic
+        terminal = false
         begin
-          received = stream_once
+          stream_once
+        rescue StreamError => e
+          notify_error(e)
+          terminal = terminal_stream_error?(e)
         rescue StandardError => e
           notify_error(e)
         end
-        break if @stop
+        break if @stop || terminal
 
-        backoff = @initial_backoff if received
-        interruptible_sleep(backoff) { @stop }
-        backoff = [backoff * 2, @max_backoff].min
+        # Only reset backoff for a connection that proved itself by staying
+        # open past the minimum uptime, not merely because the seeded `put`
+        # was received.
+        backoff = @initial_backoff if (monotonic - started_at) >= @min_uptime
+        # Equal jitter spreads reconnects so a fleet does not stampede a
+        # restarting relay. The un-jittered backoff feeds the next doubling.
+        interruptible_sleep(apply_jitter(backoff)) { @stop }
+        backoff = next_backoff(backoff)
       end
     end
 
-    # Returns true if any event was dispatched during the connection.
+    def terminal_stream_error?(error)
+      error.is_a?(StreamError) && TERMINAL_STREAM_CODES.include?(error.code)
+    end
+
+    # Equal jitter: sleep half the window plus a random slice of the other
+    # half, keeping the delay within [backoff/2, backoff].
+    def apply_jitter(backoff)
+      half = backoff / 2.0
+      half + (rand * half)
+    end
+
+    def next_backoff(backoff)
+      [backoff * 2, @max_backoff].min
+    end
+
     def stream_once
       uri = URI.parse("#{@url}#{PATH}")
       conn = @transport.connect(uri: uri, headers: stream_headers)
       @mutex.synchronize { @conn = conn }
 
-      parser = SSEParser.new
-      received = false
+      parser = SSEParser.new(max_event_bytes: @max_event_bytes)
       conn.each_chunk do |chunk|
         break if @stop
 
-        parser.feed(chunk) do |event|
-          received = true
-          handle_event(event)
-        end
+        parser.feed(chunk) { |event| handle_event(event) }
       end
-      received
     ensure
       closing = @mutex.synchronize do
         held = @conn
@@ -189,6 +230,11 @@ module Feat
       notify_error(e)
     end
 
+    # We deliberately do not send a Last-Event-ID header to resume. The
+    # server reseeds the full datafile on every (re)connect and ignores any
+    # resume cursor, and store_datafile is version-guarded so a re-pushed
+    # snapshot is a no-op. The parsed event id is therefore left unused:
+    # tracking it for resume would be dead code.
     def stream_headers
       {
         "Authorization" => "Bearer #{@api_key}",
