@@ -55,7 +55,7 @@ Use a **server** API key (`feat_sdk_...`).
   connection and applies each new datafile the instant it changes. Updates are
   version-ordered (an older or equal datafile is never adopted) and guarded by a
   mutex shared with the evaluator.
-- Keeps a slow background poll (every 5 minutes by default) as a safety net.
+- Keeps a slow background poll (every 10 minutes by default) as a safety net.
   ETag-aware via `If-None-Match`. If the stream drops, it reconnects with
   exponential backoff while the poll keeps the datafile fresh.
 - Evaluation runs in-process: no per-flag network call.
@@ -73,7 +73,7 @@ client = Feat::Client.new(
 )
 ```
 
-When streaming is on, `safety_poll_interval:` (default 300 seconds) controls the
+When streaming is on, `safety_poll_interval:` (default 600 seconds) controls the
 backstop poll cadence.
 
 ## License
