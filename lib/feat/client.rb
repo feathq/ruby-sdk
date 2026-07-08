@@ -19,7 +19,7 @@ module Feat
     DEFAULT_POLL_INTERVAL = 30.0
     # When streaming carries updates, the poll is a backstop only and runs
     # far less often.
-    DEFAULT_SAFETY_POLL_INTERVAL = 300.0
+    DEFAULT_SAFETY_POLL_INTERVAL = 600.0
     MIN_POLL_INTERVAL = 5.0
     MAX_DATAFILE_BYTES = 10 * 1024 * 1024
     OPEN_TIMEOUT_SECONDS = 3
